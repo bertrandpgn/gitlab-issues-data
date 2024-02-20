@@ -130,7 +130,7 @@ func main() {
 			spentAt, _ := time.Parse(time.RFC3339, timelog.SpentAt)
 			localSpentAt := spentAt.In(local).Format("2006-01-02")
 
-			if localSpentAt == date && timelog.User.Username == currentUser.Username {
+			if localSpentAt >= date && timelog.User.Username == currentUser.Username {
 				totalSpentTime += float32(timelog.TimeSpent) / 3600
 				log.Printf("%.1fh at %s - #%s: %s\n", float32(timelog.TimeSpent)/3600, localSpentAt, issue.IID, issue.Title)
 			}
