@@ -10,6 +10,11 @@ cp .env.dist .env
 # fill .env with correct values
 
 go run main.go
-# or if you downloaded the bin directly (cp it in your PATH to use it everywhere)
-./gitlab-issues-data
+```
+
+Build:
+
+```bash
+GOOS=darwin GOARCH=amd64 go build main.go # intel macOS
+GOOS=darwin GOARCH=arm64 go build main.go # mX macOS
 ```
