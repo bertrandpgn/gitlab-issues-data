@@ -6,12 +6,138 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
 	graphql "github.com/machinebox/graphql"
 	gitlab "github.com/xanzy/go-gitlab"
 )
+
+type TimelogData struct {
+	Project struct {
+		Issues struct {
+			Nodes []struct {
+				IID      string `json:"iid"`
+				Title    string `json:"title"`
+				Timelogs struct {
+					Nodes []struct {
+						TimeSpent int    `json:"timeSpent"`
+						SpentAt   string `json:"spentAt"`
+						User      struct {
+							Username string `json:"username"`
+						} `json:"user"`
+					} `json:"nodes"`
+				} `json:"timelogs"`
+			} `json:"nodes"`
+		} `json:"issues"`
+	} `json:"project"`
+}
+
+func getTimelogs(projectId string, apiToken string, client *graphql.Client, ctx context.Context) (*TimelogData, error) {
+	// Construct the GraphQL query
+	req := graphql.NewRequest(`
+		query($fullPath: ID!) {
+			project(fullPath: $fullPath) {
+				issues {
+					nodes {
+						iid
+						title
+						timelogs {
+							nodes {
+								timeSpent
+								spentAt
+								user {
+									username
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		`)
+
+	req.Var("fullPath", projectId)
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
+
+	var data TimelogData
+	if err := client.Run(ctx, req, &data); err != nil {
+		return nil, err
+	}
+
+	return &data, nil
+}
+
+func getUserSpentTime(daysNum int, username string, timelogData *TimelogData) {
+
+	var totalSpentTime float32
+	date := time.Now().AddDate(0, 0, -daysNum).Format("2006-01-02")
+	local, _ := time.LoadLocation("Local")
+
+	for _, issue := range timelogData.Project.Issues.Nodes {
+		for _, timelog := range issue.Timelogs.Nodes {
+
+			// When selecting dates only, Gitlab will set the time to midnight local time
+			// So it might fail to load timelogs for today as it can be minus few hours and lose one day (depending on the timezone)
+			spentAt, _ := time.Parse(time.RFC3339, timelog.SpentAt)
+			localSpentAt := spentAt.In(local).Format("2006-01-02")
+
+			if localSpentAt >= date && timelog.User.Username == username {
+				totalSpentTime += float32(timelog.TimeSpent) / 3600
+				log.Printf("%.1fh at %s - #%s: %s\n", float32(timelog.TimeSpent)/3600, localSpentAt, issue.IID, issue.Title)
+			}
+		}
+	}
+	log.Printf("Total spent time since %s for %s : %.1fh", date, username, totalSpentTime)
+}
+
+func getAllUsersSpentTime(daysNum int, trackingIssue string, timelogData *TimelogData) {
+	// store a map of username = total spent time on tickets
+	totalDevTimePerUser := make(map[string]float32)
+	totalNonDevTimePerUser := make(map[string]float32)
+
+	date := time.Now().AddDate(0, 0, -daysNum).Format("2006-01-02")
+	local, _ := time.LoadLocation("Local")
+
+	for _, issue := range timelogData.Project.Issues.Nodes {
+		for _, timelog := range issue.Timelogs.Nodes {
+
+			// When selecting dates only, Gitlab will set the time to midnight local time
+			// So it might fail to load timelogs for today as it can be minus few hours and lose one day (depending on the timezone)
+			spentAt, _ := time.Parse(time.RFC3339, timelog.SpentAt)
+			localSpentAt := spentAt.In(local).Format("2006-01-02")
+
+			if localSpentAt >= date {
+				if strings.Contains(issue.Title, trackingIssue) {
+					totalNonDevTimePerUser[timelog.User.Username] += float32(timelog.TimeSpent) / 3600
+				} else {
+					totalDevTimePerUser[timelog.User.Username] += float32(timelog.TimeSpent) / 3600
+				}
+				log.Printf("%.1fh at %s by %s - #%s: %s\n", float32(timelog.TimeSpent)/3600, localSpentAt, timelog.User.Username, issue.IID, issue.Title)
+			}
+		}
+	}
+
+	log.Println("-- Total dev time spent --")
+
+	var totalDevSpentTime float32
+	for username, time := range totalDevTimePerUser {
+		log.Printf("since %s for %s : %.1fh", date, username, time)
+		totalDevSpentTime += time
+	}
+
+	log.Printf("Total : %.1fh", totalDevSpentTime)
+
+	log.Println("-- Total NON dev time spent--")
+	var totalNonDevSpentTime float32
+	for username, time := range totalNonDevTimePerUser {
+		log.Printf("since %s for %s : %.1fh", date, username, time)
+		totalNonDevSpentTime += time
+	}
+
+	log.Printf("Total : %.1fh", totalNonDevSpentTime)
+}
 
 func main() {
 	err := godotenv.Load()
@@ -47,6 +173,9 @@ func main() {
 		log.Fatal("DAYS_NUM must be in integer, it represents the number of previous days to fetch issues for")
 	}
 
+	getAllUsers := os.Getenv("ALL_USERS")
+	reportingIssue := os.Getenv("GITLAB_REPORTING_ISSUE")
+
 	gitlabAPIUrl := gitlabHost + "/api/v4"
 	gitlabGraphQLUrl := gitlabHost + "/api/graphql"
 
@@ -62,80 +191,19 @@ func main() {
 	}
 
 	// Gitlab REST API does not provide timelog object on issues with who log what, only the graphQL API does that
-	client := graphql.NewClient(gitlabGraphQLUrl)
+	graphQLClient := graphql.NewClient(gitlabGraphQLUrl)
 
-	// Construct the GraphQL query
-	req := graphql.NewRequest(`
-    query($fullPath: ID!) {
-        project(fullPath: $fullPath) {
-            issues {
-                nodes {
-                    iid
-                    title
-                    timelogs {
-                        nodes {
-                            timeSpent
-                            spentAt
-                            user {
-                                username
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    `)
-
-	req.Var("fullPath", projectId)
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
-
-	var respData struct {
-		Project struct {
-			Issues struct {
-				Nodes []struct {
-					IID      string `json:"iid"`
-					Title    string `json:"title"`
-					Timelogs struct {
-						Nodes []struct {
-							TimeSpent int    `json:"timeSpent"`
-							SpentAt   string `json:"spentAt"`
-							User      struct {
-								Username string `json:"username"`
-							} `json:"user"`
-						} `json:"nodes"`
-					} `json:"timelogs"`
-				} `json:"nodes"`
-			} `json:"issues"`
-		} `json:"project"`
-	}
-
-	// Execute the query
+	// Get go context
 	ctx := context.Background()
-	if err := client.Run(ctx, req, &respData); err != nil {
+
+	timelogData, err := getTimelogs(projectId, apiToken, graphQLClient, ctx)
+	if err != nil {
 		log.Fatalf("Failed to execute query: %v", err)
 	}
 
-	// Now, filter the issues based on `spentAt` and `myUsername`
-	// today := time.Now().Format("2006-01-02")
-	var totalSpentTime float32
-	date := time.Now().AddDate(0, 0, -daysNum).Format("2006-01-02")
-	local, _ := time.LoadLocation("Local")
-
-	for _, issue := range respData.Project.Issues.Nodes {
-		for _, timelog := range issue.Timelogs.Nodes {
-
-			// When selecting dates only, Gitlab will set the time to midnight local time
-			// So it might fail to load timelogs for today as it can be minus few hours and lose one day (depending on the timezone)
-			spentAt, _ := time.Parse(time.RFC3339, timelog.SpentAt)
-			localSpentAt := spentAt.In(local).Format("2006-01-02")
-
-			if localSpentAt >= date && timelog.User.Username == currentUser.Username {
-				totalSpentTime += float32(timelog.TimeSpent) / 3600
-				log.Printf("%.1fh at %s - #%s: %s\n", float32(timelog.TimeSpent)/3600, localSpentAt, issue.IID, issue.Title)
-			}
-		}
+	if getAllUsers == "" {
+		getUserSpentTime(daysNum, currentUser.Username, timelogData)
+	} else {
+		getAllUsersSpentTime(daysNum, reportingIssue, timelogData)
 	}
-
-	log.Printf("Total spent time since %s for %s : %.1fh", date, currentUser.Username, totalSpentTime)
 }
